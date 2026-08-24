@@ -31,11 +31,17 @@ impl TransactionManager for PgTransactionManager {
 
             let rollback = Rollback::new(conn);
             rollback.conn.queue_simple_query(&statement)?;
+            // Claim the depth before the round trip, not after. `start_rollback` is a no-op
+            // while the depth is zero, so a future cancelled during this await would
+            // otherwise leave the server in a transaction with nothing queued to end it —
+            // and `Pool` hands that connection to the next borrower, whose statements then
+            // run inside it. Unwound just below if the BEGIN did not take.
+            rollback.conn.inner.transaction_depth += 1;
             rollback.conn.wait_until_ready().await?;
             if !rollback.conn.in_transaction() {
+                rollback.conn.inner.transaction_depth -= 1;
                 return Err(Error::BeginFailed);
             }
-            rollback.conn.inner.transaction_depth += 1;
             rollback.defuse();
 
             Ok(())
