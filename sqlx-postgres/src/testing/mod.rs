@@ -104,7 +104,7 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
         // Postgres' normal connection limit is 100 plus 3 superuser connections
         // We don't want to use the whole cap and there may be fuzziness here due to
         // concurrently running tests anyway.
-        .max_connections(20)
+        .max_connections(master_max_connections())
         // Immediately close master connections. Tokio's I/O streams don't like hopping runtimes.
         .after_release(|_conn, _| Box::pin(async move { Ok(false) }))
         .connect_lazy_with(master_opts);
@@ -205,6 +205,21 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
             .database(&db_name),
         db_name,
     })
+}
+
+/// Every test pool takes its connections out of the master pool's permits and keeps the ones it
+/// took until it closes, so tests running at once can split all of them and each wait on a
+/// connection another one holds until their acquire times out. `SQLX_TEST_MAX_CONNECTIONS` lifts
+/// the cap: 5 per test thread, a test pool's own cap, rules that out.
+fn master_max_connections() -> u32 {
+    dotenvy::var("SQLX_TEST_MAX_CONNECTIONS")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse()
+                .expect("SQLX_TEST_MAX_CONNECTIONS must be a positive integer")
+        })
+        .unwrap_or(20)
 }
 
 async fn do_cleanup(conn: &mut PgConnection, db_name: &str) -> Result<(), Error> {
