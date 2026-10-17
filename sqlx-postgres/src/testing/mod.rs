@@ -181,10 +181,10 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
     let create_command = format!("create database {db_name:?}");
     debug_assert!(create_command.starts_with("create database \""));
     match args.migrator {
-        Some(migrator) => {
+        Some(migrator) if template_enabled() => {
             create_from_template(&mut conn, master_pool, migrator, &create_command).await?
         }
-        None => {
+        _ => {
             conn.execute(&(create_command)[..]).await?;
         }
     }
@@ -216,6 +216,14 @@ async fn do_cleanup(conn: &mut PgConnection, db_name: &str) -> Result<(), Error>
         .await?;
 
     Ok(())
+}
+
+/// Template cloning is opt-in through `SQLX_TEST_TEMPLATE`: it leaves `_sqlx_tmpl_*` databases
+/// on the server between runs, which a test suite must agree to.
+fn template_enabled() -> bool {
+    std::env::var("SQLX_TEST_TEMPLATE")
+        .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+        .unwrap_or(false)
 }
 
 /// Runs `create_command` cloning a template that holds `migrator`'s migrations, building the

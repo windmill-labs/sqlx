@@ -177,6 +177,14 @@ async fn basic_test(pool: PgPool) -> sqlx::Result<()> {
 # }
 ```
 
+#### Migrating once per test run (Postgres only)
+
+With `SQLX_TEST_TEMPLATE=true` (or `1`) set when the tests run, each distinct set of migrations
+is applied once to a template database, and every test database is created as a copy of it with
+`CREATE DATABASE .. TEMPLATE` instead of being migrated. Templates are named `_sqlx_tmpl_<hash>`
+and stay on the server between runs; one unused for a day is dropped. Fixtures still apply to
+each test's own copy.
+
 ### Automatic Fixture Application (requires `migrate` feature)
 
 Since tests are isolated from each other but may require data to already exist in the database to keep from growing
