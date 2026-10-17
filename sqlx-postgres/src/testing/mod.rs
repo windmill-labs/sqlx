@@ -1,8 +1,6 @@
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::ops::Deref;
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
@@ -24,8 +22,6 @@ pub(crate) use sqlx_core::testing::*;
 
 // Using a blocking `OnceCell` here because the critical sections are short.
 static MASTER_POOL: OnceCell<Pool<Postgres>> = OnceCell::new();
-// Templates this process has already seen built, so later tests skip the advisory lock.
-static READY_TEMPLATES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 // Automatically delete any databases created before the start of the test binary.
 
 impl TestSupport for Postgres {
@@ -163,6 +159,8 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
             created_at timestamptz not null default now(),
             last_used_at timestamptz not null default now()
         );
+
+        alter table _sqlx_test.templates add column if not exists master_db text;
     "#,
     )
     .await?;
@@ -180,13 +178,16 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
     .execute(&mut *conn)
     .await?;
 
-    let mut create_command = format!("create database {db_name:?}");
+    let create_command = format!("create database {db_name:?}");
     debug_assert!(create_command.starts_with("create database \""));
-    if let Some(migrator) = args.migrator {
-        let template = migrated_template(&mut conn, master_pool, migrator).await?;
-        write!(create_command, " template {template:?}").ok();
+    match args.migrator {
+        Some(migrator) => {
+            create_from_template(&mut conn, master_pool, migrator, &create_command).await?
+        }
+        None => {
+            conn.execute(&(create_command)[..]).await?;
+        }
     }
-    conn.execute(&(create_command)[..]).await?;
 
     Ok(TestContext {
         pool_opts: PoolOptions::new()
@@ -217,29 +218,26 @@ async fn do_cleanup(conn: &mut PgConnection, db_name: &str) -> Result<(), Error>
     Ok(())
 }
 
-/// Returns the name of a database holding `migrator`'s migrations, building it if needed.
+/// Runs `create_command` cloning a template that holds `migrator`'s migrations, building the
+/// template first if needed.
 ///
-/// Each test database is cloned from it with `CREATE DATABASE .. TEMPLATE`, which is much
-/// cheaper than applying every migration per test. The name hashes the master database and
-/// every migration, so a changed migration set never reuses a stale template, and test
-/// binaries sharing a server but not a master database never share one. Building happens under
-/// an advisory lock held by every builder, and a template counts as built only once its row in
-/// `_sqlx_test.templates` exists, so one left behind by a crashed build is dropped and rebuilt.
-async fn migrated_template(
+/// `CREATE DATABASE .. TEMPLATE` is much cheaper than applying every migration per test. The
+/// template's name hashes the master database and every migration, so a changed migration set
+/// never reuses a stale template, and masters sharing a server never share one. Clones hold the
+/// template's advisory lock shared and builds and drops hold it exclusively, so no template is
+/// dropped or rebuilt under a clone. It counts as built only once its row exists and the
+/// database is marked as a template, so one left by a crashed build is dropped and rebuilt.
+async fn create_from_template(
     conn: &mut PgConnection,
     master_pool: &Pool<Postgres>,
     migrator: &Migrator,
-) -> Result<String, Error> {
+    create_command: &str,
+) -> Result<(), Error> {
     let master_opts = master_pool.connect_options();
+    let master_db = master_opts.database.as_deref().unwrap_or_default();
 
     let mut hasher = Sha512::new();
-    hasher.update(
-        master_opts
-            .database
-            .as_deref()
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    hasher.update(master_db.as_bytes());
     for migration in migrator.iter() {
         hasher.update(migration.version.to_le_bytes());
         hasher.update(format!("{:?}", migration.migration_type).as_bytes());
@@ -250,62 +248,128 @@ async fn migrated_template(
     let hash = hasher.finalize();
     let template = format!("_sqlx_tmpl_{}", URL_SAFE.encode(&hash[..39])).replace('-', "_");
     debug_assert!(template.len() == 63);
+    let lock_key = template_lock_key(&template);
+    let clone_command = format!("{create_command} template {template:?}");
 
-    if READY_TEMPLATES
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashSet::new)
-        .contains(&template)
-    {
-        return Ok(template);
+    // On error a held lock is released with the connection, which the master pool closes.
+    query("select pg_advisory_lock_shared($1)")
+        .bind(lock_key)
+        .execute(&mut *conn)
+        .await?;
+    if template_ready(conn, &template).await? {
+        conn.execute(&*clone_command).await?;
+        query("select pg_advisory_unlock_shared($1)")
+            .bind(lock_key)
+            .execute(&mut *conn)
+            .await?;
+        return Ok(());
     }
-
-    let lock_key = i64::from_le_bytes(hash[39..47].try_into().unwrap());
-    query("select pg_advisory_lock($1)")
+    query("select pg_advisory_unlock_shared($1)")
         .bind(lock_key)
         .execute(&mut *conn)
         .await?;
 
-    // On error the lock is released with the connection, which the master pool closes.
-    let ready: bool = query_scalar(
-        "update _sqlx_test.templates set last_used_at = now() where db_name = $1 returning true",
+    query("select pg_advisory_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *conn)
+        .await?;
+    if !template_ready(conn, &template).await? {
+        build_template(conn, &master_opts, migrator, &template).await?;
+        drop_stale_templates(conn, master_db, &template).await?;
+    }
+    conn.execute(&*clone_command).await?;
+    query("select pg_advisory_unlock($1)")
+        .bind(lock_key)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(())
+}
+
+fn template_lock_key(template: &str) -> i64 {
+    let hash = Sha512::digest(template.as_bytes());
+    i64::from_le_bytes(hash[..8].try_into().unwrap())
+}
+
+async fn template_ready(conn: &mut PgConnection, template: &str) -> Result<bool, Error> {
+    Ok(query_scalar(
+        "update _sqlx_test.templates set last_used_at = now() \
+         where db_name = $1 \
+         and exists (select from pg_database where datname = $1 and datistemplate) \
+         returning true",
     )
-    .bind(&template)
+    .bind(template)
     .fetch_optional(&mut *conn)
     .await?
-    .unwrap_or(false);
+    .unwrap_or(false))
+}
 
-    if !ready {
-        drop_template(conn, &template).await?;
-        conn.execute(&*format!("create database {template:?}"))
-            .await?;
-
-        let mut template_conn =
-            PgConnection::connect_with(&master_opts.deref().clone().database(&template)).await?;
-        migrator.run_direct(&mut template_conn).await?;
-        template_conn.close().await?;
-
-        // Nothing may stay connected to a template while it is cloned.
-        conn.execute(&*format!(
-            "alter database {template:?} with is_template true allow_connections false"
-        ))
+async fn build_template(
+    conn: &mut PgConnection,
+    master_opts: &PgConnectOptions,
+    migrator: &Migrator,
+    template: &str,
+) -> Result<(), Error> {
+    // `force`: an interrupted build can leave its migration session running on the template.
+    drop_template(conn, template, true).await?;
+    conn.execute(&*format!("create database {template:?}"))
         .await?;
-        query("insert into _sqlx_test.templates(db_name) values ($1)")
-            .bind(&template)
-            .execute(&mut *conn)
-            .await?;
 
-        // Templates of other migration sets pile up as migrations change; a day unused is
-        // long enough that no running test binary still clones from one.
-        let stale: Vec<String> = query_scalar(
-            "select db_name from _sqlx_test.templates \
-             where db_name <> $1 and last_used_at < now() - interval '1 day'",
+    let mut template_conn =
+        PgConnection::connect_with(&master_opts.clone().database(template)).await?;
+    migrator.run_direct(&mut template_conn).await?;
+    template_conn.close().await?;
+
+    // Nothing may stay connected to a template while it is cloned.
+    conn.execute(&*format!(
+        "alter database {template:?} with is_template true allow_connections false"
+    ))
+    .await?;
+    query(
+        "insert into _sqlx_test.templates(db_name, master_db) values ($1, current_database()) \
+         on conflict (db_name) do update set created_at = now(), last_used_at = now()",
+    )
+    .bind(template)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Drops this master's templates of other migration sets once unused for a day, skipping any
+/// a clone or build holds the lock of.
+async fn drop_stale_templates(
+    conn: &mut PgConnection,
+    master_db: &str,
+    current: &str,
+) -> Result<(), Error> {
+    // `master_db` keeps a master copied from another database from dropping that one's templates.
+    let stale: Vec<String> = query_scalar(
+        "select db_name from _sqlx_test.templates \
+         where master_db = $1 and db_name <> $2 and last_used_at < now() - interval '1 day'",
+    )
+    .bind(master_db)
+    .bind(current)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    for stale in stale {
+        let lock_key = template_lock_key(&stale);
+        let locked: bool = query_scalar("select pg_try_advisory_lock($1)")
+            .bind(lock_key)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !locked {
+            continue;
+        }
+        let still_stale: bool = query_scalar(
+            "select exists (select from _sqlx_test.templates \
+             where db_name = $1 and last_used_at < now() - interval '1 day')",
         )
-        .bind(&template)
-        .fetch_all(&mut *conn)
+        .bind(&stale)
+        .fetch_one(&mut *conn)
         .await?;
-        for stale in stale {
-            match drop_template(conn, &stale).await {
+        if still_stale {
+            match drop_template(conn, &stale, false).await {
                 Ok(()) => {
                     query("delete from _sqlx_test.templates where db_name = $1")
                         .bind(&stale)
@@ -318,23 +382,15 @@ async fn migrated_template(
                 Err(e) => return Err(e),
             }
         }
+        query("select pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *conn)
+            .await?;
     }
-
-    query("select pg_advisory_unlock($1)")
-        .bind(lock_key)
-        .execute(&mut *conn)
-        .await?;
-
-    READY_TEMPLATES
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashSet::new)
-        .insert(template.clone());
-
-    Ok(template)
+    Ok(())
 }
 
-async fn drop_template(conn: &mut PgConnection, template: &str) -> Result<(), Error> {
+async fn drop_template(conn: &mut PgConnection, template: &str, force: bool) -> Result<(), Error> {
     let exists: bool = query_scalar("select exists (select from pg_database where datname = $1)")
         .bind(template)
         .fetch_one(&mut *conn)
@@ -344,7 +400,8 @@ async fn drop_template(conn: &mut PgConnection, template: &str) -> Result<(), Er
             "alter database {template:?} with is_template false allow_connections true"
         ))
         .await?;
-        conn.execute(&*format!("drop database {template:?}"))
+        let force = if force { " with (force)" } else { "" };
+        conn.execute(&*format!("drop database {template:?}{force}"))
             .await?;
     }
     Ok(())
