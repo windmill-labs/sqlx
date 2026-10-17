@@ -185,6 +185,14 @@ is applied once to a template database, and every test database is created as a 
 and stay on the server between runs; one unused for a day is dropped. Fixtures still apply to
 each test's own copy.
 
+#### Connection cap (Postgres only)
+
+Test pools borrow their connections from one pool per test binary, capped at 20 connections, and
+give them back only when the test ends. Running more than 4 tests at once can therefore leave each
+of them waiting on another until the acquire timeout. `SQLX_TEST_MAX_CONNECTIONS` raises the cap;
+5 times the number of test threads rules the wait out, if the server accepts that many
+connections.
+
 ### Automatic Fixture Application (requires `migrate` feature)
 
 Since tests are isolated from each other but may require data to already exist in the database to keep from growing

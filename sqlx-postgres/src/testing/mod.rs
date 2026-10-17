@@ -100,11 +100,18 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
 
     let master_opts = PgConnectOptions::from_str(&url).expect("failed to parse DATABASE_URL");
 
+    // Test pools borrow connections from this pool and only give them back when the test ends,
+    // so a cap below `--test-threads` times 5 can leave every running test waiting on another.
+    // The default suits Postgres' normal limit of 100; `SQLX_TEST_MAX_CONNECTIONS` raises it.
+    let max_connections = std::env::var("SQLX_TEST_MAX_CONNECTIONS")
+        .map(|s| {
+            s.parse()
+                .expect("SQLX_TEST_MAX_CONNECTIONS must be a number")
+        })
+        .unwrap_or(20);
+
     let pool = PoolOptions::new()
-        // Postgres' normal connection limit is 100 plus 3 superuser connections
-        // We don't want to use the whole cap and there may be fuzziness here due to
-        // concurrently running tests anyway.
-        .max_connections(20)
+        .max_connections(max_connections)
         // Immediately close master connections. Tokio's I/O streams don't like hopping runtimes.
         .after_release(|_conn, _| Box::pin(async move { Ok(false) }))
         .connect_lazy_with(master_opts);
